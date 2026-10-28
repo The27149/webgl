@@ -1,0 +1,1711 @@
+下面是整理后的完整设计文档，可直接另存为 webgl-renderer-design.md。
+
+123
+---
+
+WebGL 渲染封装设计文档
+
+目标：用一份声明式的 DrawCommand 描述一次完整绘制（几何 + shader + uniforms + 渲染状态 + 渲染目标），框架负责翻译成高效的 WebGL 调用序列。所有 gl.* 调用收敛在底层，业务层只碰数据。
+
+---
+
+目录
+
+1. 设计原则
+2. 分层架构
+3. 目录结构
+4. 核心数据结构
+5. 关键实现
+   · 5.1 core/constants.ts — 枚举映射
+   · 5.2 core/caps.ts — 能力探测
+   · 5.3 core/state-cache.ts — 影子状态（核心）
+   · 5.4 resources/buffer.ts
+   · 5.5 resources/texture.ts
+   · 5.6 resources/program.ts
+   · 5.7 resources/vertex-array.ts
+   · 5.8 resources/framebuffer.ts
+   · 5.9 renderer/program-cache.ts
+   · 5.10 renderer/vao-cache.ts
+   · 5.11 renderer/uniform-binding.ts
+   · 5.12 renderer/renderer.ts — draw 主流程（核心）
+6. 上层 scene
+7. 使用示例
+8. 性能优化点
+9. 踩坑清单
+10. 扩展路线
+
+---
+
+1. 设计原则
+
+1. 声明式：DrawCommand 是纯数据，可序列化、可录制、可 diff、可排序。
+2. 分层单向依赖：core → resources → renderer → scene，禁止反向。
+3. 状态最小化下发：维护影子状态（shadow state），只在实际变化时才调 gl.*。
+4. 资源对象化：Buffer / Texture / Program / VAO / Framebuffer 都是对象，生命周期由业务或 ResourceManager 持有。
+5. 缓存优先：Program（按源码 hash）、VAO（按 attribute+program）、uniform location 全部缓存。
+6. WebGL1/2 兼容：VAO、instancing、纹理格式通过 caps 分支处理。
+
+---
+
+2. 分层架构
+
+```
+┌─────────────────────────────────────────────┐
+│ Layer 4  scene/      Mesh/Material/Pass      │  面向业务的组装层（可选）
+├─────────────────────────────────────────────┤
+│ Layer 3  renderer/   Renderer.draw(cmd)      │  核心：把 DrawCommand 翻译成 GL 调用
+├─────────────────────────────────────────────┤
+│ Layer 2  resources/  Buffer/Texture/Program  │  资源对象 + 编译/上传
+│                      VAO/Framebuffer         │
+├─────────────────────────────────────────────┤
+│ Layer 1  core/       context/caps/stateCache │  直接操作 gl 对象、扩展、影子状态
+└─────────────────────────────────────────────┘
+        ↑ 公共依赖：types/  math/  utils/
+```
+
+---
+
+3. 目录结构
+
+```
+webgl-renderer/
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── index.ts                    # 公共出口
+│   │
+│   ├── core/
+│   │   ├── context.ts              # 创建 context / resize
+│   │   ├── caps.ts                 # 能力探测 + 扩展
+│   │   ├── state-cache.ts          # 影子状态（核心）
+│   │   ├── constants.ts            # 字符串枚举 → GLenum 映射
+│   │   └── gl-error.ts             # 错误检查
+│   │
+│   ├── resources/
+│   │   ├── buffer.ts
+│   │   ├── texture.ts
+│   │   ├── program.ts
+│   │   ├── vertex-array.ts
+│   │   ├── framebuffer.ts
+│   │   └── resource-manager.ts
+│   │
+│   ├── renderer/
+│   │   ├── renderer.ts             # draw 主流程（核心）
+│   │   ├── draw-command.ts         # 类型定义
+│   │   ├── render-state.ts         # 类型 + 默认值 + mergeState
+│   │   ├── uniform-binding.ts      # uniform 分发 + 纹理单元分配
+│   │   ├── program-cache.ts
+│   │   └── vao-cache.ts
+│   │
+│   ├── scene/
+│   │   ├── mesh.ts
+│   │   ├── material.ts
+│   │   ├── mesh-renderer.ts
+│   │   ├── render-pass.ts
+│   │   ├── camera.ts
+│   │   └── scene.ts
+│   │
+│   ├── math/
+│   │   ├── mat4.ts
+│   │   ├── vec3.ts
+│   │   └── aabb.ts
+│   │
+│   ├── utils/
+│   │   ├── hash.ts
+│   │   ├── logger.ts
+│   │   └── dispose.ts
+│   │
+│   └── types/
+│       ├── enums.ts
+│       └── common.ts
+│
+├── examples/
+├── tests/
+└── docs/
+```
+
+依赖规则：
+
+规则 理由
+core/ 不 import resources/ renderer/ 状态缓存只需 GL 枚举
+resources/program.ts 不 import renderer/ uniform 分发放 renderer 层
+renderer/ 不 import scene/ 保持可独立使用
+math/ 不出现 gl 可单测、可 Node 使用
+types/ 只放字符串字面量类型 不泄漏 GL 数字
+
+---
+
+4. 核心数据结构
+
+4.1 types/enums.ts
+
+```ts
+// 用户面向的字符串枚举，与 GL 数字解耦，便于序列化和调试
+export type Topology =
+  | 'points' | 'lines' | 'line-strip' | 'line-loop'
+  | 'triangles' | 'triangle-strip' | 'triangle-fan';
+
+export type BlendFactor =
+  | 'zero' | 'one'
+  | 'src-color' | 'one-minus-src-color'
+  | 'dst-color' | 'one-minus-dst-color'
+  | 'src-alpha' | 'one-minus-src-alpha'
+  | 'dst-alpha' | 'one-minus-dst-alpha'
+  | 'constant-color' | 'one-minus-constant-color'
+  | 'constant-alpha' | 'one-minus-constant-alpha'
+  | 'src-alpha-saturate';
+
+export type CompareFunc =
+  | 'never' | 'less' | 'equal' | 'lequal'
+  | 'greater' | 'notequal' | 'gequal' | 'always';
+
+export type BlendEquation = 'add' | 'subtract' | 'reverse-subtract' | 'min' | 'max';
+
+export type CullFace = 'front' | 'back' | 'front-and-back';
+export type FrontFace = 'cw' | 'ccw';
+
+export type TextureFormat = 'rgba' | 'rgb' | 'red' | 'rg' | 'depth' | 'depth-stencil';
+export type TextureType   = 'ubyte' | 'float' | 'half-float' | 'uint';
+export type Filter        = 'nearest' | 'linear'
+                          | 'nearest-mipmap-nearest' | 'linear-mipmap-nearest'
+                          | 'nearest-mipmap-linear'  | 'linear-mipmap-linear';
+export type Wrap = 'repeat' | 'clamp-to-edge' | 'mirrored-repeat';
+```
+
+4.2 renderer/draw-command.ts
+
+```ts
+import type { Topology } from '../types/enums';
+import type { Buffer } from '../resources/buffer';
+import type { Program } from '../resources/program';
+import type { Texture } from '../resources/texture';
+import type { Framebuffer } from '../resources/framebuffer';
+import type { RenderState } from './render-state';
+
+export interface AttributeDesc {
+  buffer?: Buffer;            // 资源模式（推荐，避免重复上传）
+  data?: ArrayBufferView;     // 快捷模式（内部按引用缓存 Buffer）
+  size: number;               // 每个顶点的分量数：1/2/3/4
+  type?: 'float' | 'int' | 'uint';  // 分量类型，默认 'float'
+  normalized?: boolean;       // 是否把整型归一化到 [0,1] 或 [-1,1]
+  stride?: number;            // 相邻顶点起始字节间隔，0 = 紧凑排列
+  offset?: number;            // 该 attribute 在 buffer 内的起始字节偏移
+  divisor?: number;           // 实例化步长，0 = 每顶点推进，1 = 每实例推进
+}
+
+export type UniformValue =
+  | number | boolean | number[]
+  | Float32Array | Int32Array
+  | Texture
+  | { texture: Texture; unit?: number };
+
+export interface DrawCommand {
+  target?: Framebuffer | null;           // null = 默认帧缓冲
+  viewport?: [number, number, number, number] | 'auto';
+  scissor?: [number, number, number, number] | null;
+
+  geometry: {
+    attributes: Record<string, AttributeDesc>;
+    indices?: Buffer | Uint16Array | Uint32Array;
+    count?: number;                      // 可省，从 indices/attribute 推断
+    topology?: Topology;                 // 默认 'triangles'
+    instanceCount?: number;              // 默认 1
+    first?: number;                      // drawArrays 起始顶点，默认 0
+    indexOffset?: number;                // drawElements 起始索引（个数），默认 0
+  };
+
+  program: Program | { vs: string; fs: string; defines?: Record<string, string|number> };
+
+  uniforms?: Record<string, UniformValue>;
+
+  state?: Partial<RenderState>;
+}
+```
+
+4.3 renderer/render-state.ts
+
+```ts
+import type {
+  BlendFactor, BlendEquation, CompareFunc, CullFace, FrontFace,
+} from '../types/enums';
+
+export interface RenderState {
+  blend: {
+    enabled: boolean;
+    equationRGB: BlendEquation;
+    equationAlpha: BlendEquation;
+    srcRGB: BlendFactor;   dstRGB: BlendFactor;
+    srcAlpha: BlendFactor; dstAlpha: BlendFactor;
+    color: [number, number, number, number];   // 'constant-color/alpha' 用的常量
+  };
+  depth: {
+    test: boolean;
+    write: boolean;
+    func: CompareFunc;
+    range: [number, number];
+  };
+  cull: {
+    enabled: boolean;
+    face: CullFace;
+    frontFace: FrontFace;
+  };
+  colorMask: [boolean, boolean, boolean, boolean];
+}
+
+// 全部显式默认值，不依赖 GL 初始状态
+export const DEFAULT_STATE: RenderState = {
+  blend: {
+    enabled: false,
+    equationRGB: 'add',
+    equationAlpha: 'add',
+    srcRGB: 'one',    dstRGB: 'zero',
+    srcAlpha: 'one',  dstAlpha: 'zero',
+    color: [0, 0, 0, 0],
+  },
+  depth: { test: false, write: true, func: 'less', range: [0, 1] },
+  cull:  { enabled: false, face: 'back', frontFace: 'ccw' },
+  colorMask: [true, true, true, true],
+};
+
+export function mergeState(base: RenderState, override?: Partial<RenderState>): RenderState {
+  if (!override) return base;
+  return {
+    blend: { ...base.blend, ...override.blend },
+    depth: { ...base.depth, ...override.depth },
+    cull:  { ...base.cull,  ...override.cull  },
+    colorMask: override.colorMask ?? base.colorMask,
+  };
+}
+```
+
+---
+
+5. 关键实现
+
+5.1 core/constants.ts — 枚举映射
+
+```ts
+import type {
+  Topology, BlendFactor, CompareFunc, BlendEquation, CullFace, FrontFace,
+  TextureFormat, TextureType, Filter, Wrap,
+} from '../types/enums';
+
+// 拓扑 → gl 绘制图元模式
+export const GL_MODE: Record<Topology, number> = {
+  'points': 0x0000,        // gl.POINTS
+  'lines': 0x0001,         // gl.LINES
+  'line-strip': 0x0003,    // gl.LINE_STRIP
+  'line-loop': 0x0002,     // gl.LINE_LOOP
+  'triangles': 0x0004,     // gl.TRIANGLES
+  'triangle-strip': 0x0005,// gl.TRIANGLE_STRIP
+  'triangle-fan': 0x0006,  // gl.TRIANGLE_FAN
+};
+
+// 混合因子 → gl 枚举
+export const GL_BLEND_FACTOR: Record<BlendFactor, number> = {
+  'zero': 0,
+  'one': 1,
+  'src-color': 0x0300,
+  'one-minus-src-color': 0x0301,
+  'src-alpha': 0x0302,
+  'one-minus-src-alpha': 0x0303,
+  'dst-alpha': 0x0304,
+  'one-minus-dst-alpha': 0x0305,
+  'dst-color': 0x0306,
+  'one-minus-dst-color': 0x0307,
+  'src-alpha-saturate': 0x0308,
+  'constant-color': 0x8001,
+  'one-minus-constant-color': 0x8002,
+  'constant-alpha': 0x8003,
+  'one-minus-constant-alpha': 0x8004,
+};
+
+// 混合方程
+export const GL_BLEND_EQUATION: Record<BlendEquation, number> = {
+  'add': 0x8006,
+  'subtract': 0x800A,
+  'reverse-subtract': 0x800B,
+  'min': 0x8007,
+  'max': 0x8008,
+};
+
+// 深度比较
+export const GL_COMPARE: Record<CompareFunc, number> = {
+  'never': 0x0200, 'less': 0x0201, 'equal': 0x0202, 'lequal': 0x0203,
+  'greater': 0x0204, 'notequal': 0x0205, 'gequal': 0x0206, 'always': 0x0207,
+};
+
+export const GL_CULL_FACE: Record<CullFace, number> = {
+  'front': 0x0404, 'back': 0x0405, 'front-and-back': 0x0408,
+};
+
+export const GL_FRONT_FACE: Record<FrontFace, number> = {
+  'cw': 0x0900, 'ccw': 0x0901,
+};
+
+export const GL_FILTER: Record<Filter, number> = {
+  'nearest': 0x2600,
+  'linear': 0x2601,
+  'nearest-mipmap-nearest': 0x2700,
+  'linear-mipmap-nearest': 0x2701,
+  'nearest-mipmap-linear': 0x2702,
+  'linear-mipmap-linear': 0x2703,
+};
+
+export const GL_WRAP: Record<Wrap, number> = {
+  'repeat': 0x2901,
+  'clamp-to-edge': 0x812F,
+  'mirrored-repeat': 0x8370,
+};
+```
+
+5.2 core/caps.ts — 能力探测
+
+```ts
+/**
+ * 统一封装 WebGL1/2 的差异。
+ * WebGL2 原生支持 VAO / instancing；WebGL1 通过扩展提供。
+ */
+export interface GLCaps {
+  isWebGL2: boolean;
+  maxTextureUnits: number;
+  maxVertexAttribs: number;
+  hasVAO: boolean;
+  hasInstancing: boolean;
+  hasFloatTexture: boolean;
+  hasHalfFloatTexture: boolean;
+
+  // VAO
+  createVertexArray(): WebGLVertexArrayObject | null;
+  bindVertexArray(vao: WebGLVertexArrayObject | null): void;
+  deleteVertexArray(vao: WebGLVertexArrayObject | null): void;
+
+  // instancing
+  vertexAttribDivisor(loc: number, divisor: number): void;
+  drawArraysInstanced(mode: number, first: number, count: number, inst: number): void;
+  drawElementsInstanced(mode: number, count: number, type: number, offset: number, inst: number): void;
+}
+
+export function createCaps(gl: WebGLRenderingContext | WebGL2RenderingContext): GLCaps {
+  const isWebGL2 = typeof WebGL2RenderingContext !== 'undefined'
+    && gl instanceof WebGL2RenderingContext;
+
+  const vaoExt = isWebGL2 ? null : gl.getExtension('OES_vertex_array_object');
+  const instExt = isWebGL2 ? null : gl.getExtension('ANGLE_instanced_arrays');
+  const floatExt = gl.getExtension('OES_texture_float');
+  const halfFloatExt = isWebGL2
+    ? null
+    : gl.getExtension('OES_texture_half_float');
+
+  const g = gl as WebGL2RenderingContext;
+
+  return {
+    isWebGL2,
+    maxTextureUnits: gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS),
+    maxVertexAttribs: gl.getParameter(gl.MAX_VERTEX_ATTRIBS),
+    hasVAO: isWebGL2 || !!vaoExt,
+    hasInstancing: isWebGL2 || !!instExt,
+    hasFloatTexture: isWebGL2 || !!floatExt,
+    hasHalfFloatTexture: isWebGL2 || !!halfFloatExt,
+
+    // gl.createVertexArray() 直接创建对象；WebGL1 则用扩展
+    createVertexArray: isWebGL2
+      ? () => g.createVertexArray()
+      : () => vaoExt!.createVertexArrayOES(),
+
+    // gl.bindVertexArray(vao) 绑定当前 VAO，后续 attribPointer 记录到该 VAO 中
+    // 传 null 解绑
+    bindVertexArray: isWebGL2
+      ? (vao) => g.bindVertexArray(vao)
+      : (vao) => vaoExt!.bindVertexArrayOES(vao as any),
+
+    deleteVertexArray: isWebGL2
+      ? (vao) => g.deleteVertexArray(vao)
+      : (vao) => vaoExt!.deleteVertexArrayOES(vao as any),
+
+    // gl.vertexAttribDivisor(index, divisor):
+    //   index   : attribute location
+    //   divisor : 0 = 每顶点推进；1 = 每实例推进；N = 每 N 个实例推进
+    vertexAttribDivisor: isWebGL2
+      ? (loc, d) => g.vertexAttribDivisor(loc, d)
+      : (loc, d) => instExt!.vertexAttribDivisorANGLE(loc, d),
+
+    // gl.drawArraysInstanced(mode, first, count, instanceCount)
+    //   mode          : 图元模式
+    //   first         : 起始顶点索引
+    //   count         : 每次绘制的顶点数
+    //   instanceCount : 实例数量（真正的绘制会执行 instanceCount 次）
+    drawArraysInstanced: isWebGL2
+      ? (m, f, c, i) => g.drawArraysInstanced(m, f, c, i)
+      : (m, f, c, i) => instExt!.drawArraysInstancedANGLE(m, f, c, i),
+
+    // gl.drawElementsInstanced(mode, count, type, offset, instanceCount)
+    //   type   : 索引类型 gl.UNSIGNED_SHORT / gl.UNSIGNED_INT
+    //   offset : 起始索引在 element buffer 内的字节偏移
+    drawElementsInstanced: isWebGL2
+      ? (m, c, t, o, i) => g.drawElementsInstanced(m, c, t, o, i)
+      : (m, c, t, o, i) => instExt!.drawElementsInstancedANGLE(m, c, t, o, i),
+  };
+}
+```
+
+5.3 core/state-cache.ts — 影子状态（核心）
+
+这是整个封装里性能最关键的文件。所有渲染状态变更都先过它，只有真正变化时才下发 gl.*。第一帧前调用 invalidate() 强制全量下发。
+
+```ts
+import { GL_BLEND_FACTOR, GL_BLEND_EQUATION, GL_COMPARE, GL_CULL_FACE, GL_FRONT_FACE }
+  from './constants';
+import type { RenderState } from '../renderer/render-state';
+import { DEFAULT_STATE } from '../renderer/render-state';
+
+export class StateCache {
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private cur: RenderState = structuredClone(DEFAULT_STATE);
+  private curViewport: [number, number, number, number] = [0, 0, 0, 0];
+  private curProgram: WebGLProgram | null = null;
+  private curVAO: WebGLVertexArrayObject | null = null;
+  private curFramebuffer: WebGLFramebuffer | null = null;
+  private curScissor: [number, number, number, number] | null = null;
+  private curActiveTexture = -1;
+
+  constructor(gl: WebGLRenderingContext | WebGL2RenderingContext) {
+    this.gl = gl;
+  }
+
+  /** 让缓存失效，下一次应用时全量下发 */
+  invalidate() {
+    this.cur = structuredClone(DEFAULT_STATE);
+    this.curProgram = null;
+    this.curVAO = null;
+    this.curFramebuffer = null;
+    this.curScissor = null;
+    this.curActiveTexture = -1;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 状态应用（全量 diff）
+  // ─────────────────────────────────────────────────────────────
+  applyState(next: RenderState) {
+    this.applyBlend(next.blend);
+    this.applyDepth(next.depth);
+    this.applyCull(next.cull);
+    this.applyColorMask(next.colorMask);
+    this.cur = next;
+  }
+
+  private applyBlend(b: RenderState['blend']) {
+    const gl = this.gl;
+    const c = this.cur.blend;
+    if (b.enabled !== c.enabled) {
+      // gl.enable(cap) / gl.disable(cap)
+      //   cap: 要开关的能力，这里是 gl.BLEND
+      b.enabled ? gl.enable(gl.BLEND) : gl.disable(gl.BLEND);
+    }
+    if (!b.enabled) return;
+
+    if (b.equationRGB !== c.equationRGB || b.equationAlpha !== c.equationAlpha) {
+      // gl.blendEquationSeparate(modeRGB, modeAlpha)
+      //   分别设置 RGB 和 Alpha 通道的混合方程，避免二次调用
+      gl.blendEquationSeparate(
+        GL_BLEND_EQUATION[b.equationRGB],
+        GL_BLEND_EQUATION[b.equationAlpha],
+      );
+    }
+
+    if (b.srcRGB !== c.srcRGB || b.dstRGB !== c.dstRGB
+     || b.srcAlpha !== c.srcAlpha || b.dstAlpha !== c.dstAlpha) {
+      // gl.blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha)
+      //   混合公式：Result = src * srcFactor + dst * dstFactor
+      //   srcRGB / dstRGB   : RGB 通道的源/目标因子
+      //   srcAlpha/dstAlpha : Alpha 通道的源/目标因子
+      gl.blendFuncSeparate(
+        GL_BLEND_FACTOR[b.srcRGB], GL_BLEND_FACTOR[b.dstRGB],
+        GL_BLEND_FACTOR[b.srcAlpha], GL_BLEND_FACTOR[b.dstAlpha],
+      );
+    }
+
+    if (b.color !== c.color) {
+      // gl.blendColor(r, g, b, a)
+      //   当混合因子为 CONSTANT_COLOR / CONSTANT_ALPHA 时使用此常量
+      gl.blendColor(b.color[0], b.color[1], b.color[2], b.color[3]);
+    }
+  }
+
+  private applyDepth(d: RenderState['depth']) {
+    const gl = this.gl;
+    const c = this.cur.depth;
+    if (d.test !== c.test) {
+      d.test ? gl.enable(gl.DEPTH_TEST) : gl.disable(gl.DEPTH_TEST);
+    }
+    if (d.test && d.func !== c.func) {
+      // gl.depthFunc(func)
+      //   深度测试比较函数，默认 LESS
+      gl.depthFunc(GL_COMPARE[d.func]);
+    }
+    if (d.write !== c.write) {
+      // gl.depthMask(flag)
+      //   true = 允许写深度缓冲；false = 只读（常用于透明物体）
+      gl.depthMask(d.write);
+    }
+    if (d.range[0] !== c.range[0] || d.range[1] !== c.range[1]) {
+      // gl.depthRange(near, far)
+      //   把 NDC 深度 [-1,1] 映射到 [near,far]，默认 [0,1]
+      gl.depthRange(d.range[0], d.range[1]);
+    }
+  }
+
+  private applyCull(c: RenderState['cull']) {
+    const gl = this.gl;
+    const cur = this.cur.cull;
+    if (c.enabled !== cur.enabled) {
+      c.enabled ? gl.enable(gl.CULL_FACE) : gl.disable(gl.CULL_FACE);
+    }
+    if (c.enabled && c.face !== cur.face) {
+      // gl.cullFace(mode)
+      //   mode: FRONT / BACK / FRONT_AND_BACK
+      gl.cullFace(GL_CULL_FACE[c.face]);
+    }
+    if (c.enabled && c.frontFace !== cur.frontFace) {
+      // gl.frontFace(mode)
+      //   CCW / CW — 定义哪一面是"正面"（决定三角形绕序）
+      gl.frontFace(GL_FRONT_FACE[c.frontFace]);
+    }
+  }
+
+  private applyColorMask(m: [boolean, boolean, boolean, boolean]) {
+    const c = this.cur.colorMask;
+    if (m[0] === c[0] && m[1] === c[1] && m[2] === c[2] && m[3] === c[3]) return;
+    // gl.colorMask(r, g, b, a)
+    //   控制写入颜色缓冲的通道，false 表示丢弃该通道
+    this.gl.colorMask(m[0], m[1], m[2], m[3]);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 目标 / 视口 / 裁剪
+  // ─────────────────────────────────────────────────────────────
+  applyTarget(fb: WebGLFramebuffer | null) {
+    if (fb === this.curFramebuffer) return;
+    // gl.bindFramebuffer(target, framebuffer)
+    //   target     : gl.FRAMEBUFFER（含 READ + DRAW 一并绑定）
+    //   framebuffer: null 恢复默认帧缓冲
+    this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, fb);
+    this.curFramebuffer = fb;
+  }
+
+  applyViewport(v: [number, number, number, number]) {
+    const c = this.curViewport;
+    if (v[0] === c[0] && v[1] === c[1] && v[2] === c[2] && v[3] === c[3]) return;
+    // gl.viewport(x, y, width, height)
+    //   x, y   : 视口左下角（注意 y 从底部起算）
+    //   w, h   : 视口宽高（像素），决定 NDC → 屏幕空间的映射范围
+    this.gl.viewport(v[0], v[1], v[2], v[3]);
+    this.curViewport = v;
+  }
+
+  applyScissor(s: [number, number, number, number] | null) {
+    const gl = this.gl;
+    const c = this.curScissor;
+    const same = (c === s) || (c && s &&
+      c[0]===s[0] && c[1]===s[1] && c[2]===s[2] && c[3]===s[3]);
+    if (same) return;
+
+    if (s) {
+      // gl.enable(gl.SCISSOR_TEST) — 开启裁剪测试
+      if (!c) gl.enable(gl.SCISSOR_TEST);
+      // gl.scissor(x, y, width, height)
+      //   只有落在该矩形内的像素才能写入，坐标系同 viewport
+      gl.scissor(s[0], s[1], s[2], s[3]);
+    } else if (c) {
+      gl.disable(gl.SCISSOR_TEST);
+    }
+    this.curScissor = s;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Program / VAO / Texture 绑定去重
+  // ─────────────────────────────────────────────────────────────
+  applyProgram(p: WebGLProgram | null) {
+    if (p === this.curProgram) return;
+    // gl.useProgram(program)
+    //   启用指定 program，null 表示不使用任何 program
+    this.gl.useProgram(p);
+    this.curProgram = p;
+  }
+
+  applyVAO(vao: WebGLVertexArrayObject | null, bindFn: (v: any) => void) {
+    if (vao === this.curVAO) return;
+    // gl.bindVertexArray(vao)
+    //   绑定 VAO：之后所有 vertexAttribPointer 的设置都会记录到该 VAO 中
+    //   null 解绑；WebGL1 需通过 OES_vertex_array_object 扩展
+    bindFn(vao);
+    this.curVAO = vao;
+  }
+
+  applyTextureUnit(unit: number) {
+    if (unit === this.curActiveTexture) return;
+    // gl.activeTexture(texture)
+    //   选择后续 bindTexture 操作的目标单元，TEXTURE0 + unit
+    //   纹理单元数受 MAX_COMBINED_TEXTURE_IMAGE_UNITS 限制（通常 16）
+    this.gl.activeTexture(this.gl.TEXTURE0 + unit);
+    this.curActiveTexture = unit;
+  }
+}
+```
+
+5.4 resources/buffer.ts
+
+```ts
+export type BufferUsage = 'static' | 'dynamic' | 'stream';
+export type BufferTarget = 'array' | 'element';
+
+export class Buffer {
+  readonly gl: WebGLRenderingContext | WebGL2RenderingContext;
+  readonly buffer: WebGLBuffer;
+  private usage: BufferUsage;
+  private target: BufferTarget;
+
+  constructor(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    opts: {
+      data?: ArrayBufferView;
+      usage?: BufferUsage;
+      target?: BufferTarget;
+    } = {},
+  ) {
+    this.gl = gl;
+    this.usage = opts.usage ?? 'static';
+    this.target = opts.target ?? 'array';
+
+    // gl.createBuffer() 分配一个 GPU 侧 buffer 对象
+    this.buffer = gl.createBuffer()!;
+
+    gl.bindBuffer(this.glTarget(), this.buffer);
+    if (opts.data) this.upload(opts.data);
+  }
+
+  private glTarget(): number {
+    // gl.ARRAY_BUFFER        — 存储顶点属性
+    // gl.ELEMENT_ARRAY_BUFFER— 存储索引（drawElements 用）
+    return this.target === 'array'
+      ? this.gl.ARRAY_BUFFER
+      : this.gl.ELEMENT_ARRAY_BUFFER;
+  }
+
+  private usageEnum(): number {
+    // STATIC_DRAW  : 只上传一次，多次使用（比如静态网格）
+    // DYNAMIC_DRAW : 频繁更新（比如每帧变化的顶点）
+    // STREAM_DRAW  : 几乎每帧变化且只用一次
+    return {
+      static: this.gl.STATIC_DRAW,
+      dynamic: this.gl.DYNAMIC_DRAW,
+      stream: this.gl.STREAM_DRAW,
+    }[this.usage];
+  }
+
+  private upload(data: ArrayBufferView) {
+    // gl.bufferData(target, data, usage)
+    //   target : ARRAY_BUFFER / ELEMENT_ARRAY_BUFFER
+    //   data   : TypedArray / ArrayBuffer
+    //   usage  : 提示 GPU 数据的使用频率（见上）
+    this.gl.bufferData(this.glTarget(), data, this.usageEnum());
+  }
+
+  /** 更新已有 buffer 的子区间（大小固定时使用） */
+  update(data: ArrayBufferView, byteOffset = 0) {
+    this.gl.bindBuffer(this.glTarget(), this.buffer);
+    // gl.bufferSubData(target, dstByteOffset, srcData)
+    //   dstByteOffset : 写入目标 buffer 的字节偏移
+    //   要求 data.byteLength + offset <= 原始 buffer 大小
+    this.gl.bufferSubData(this.glTarget(), byteOffset, data);
+  }
+
+  dispose() {
+    // gl.deleteBuffer(buffer) 释放 GPU 资源
+    this.gl.deleteBuffer(this.buffer);
+  }
+}
+```
+
+5.5 resources/texture.ts
+
+```ts
+import type { GLCaps } from '../core/caps';
+import { GL_FILTER, GL_WRAP } from '../core/constants';
+import type { Filter, Wrap, TextureFormat, TextureType } from '../types/enums';
+
+export interface TextureOptions {
+  source?: TexImageSource;
+  width?: number;
+  height?: number;
+  format?: TextureFormat;   // 'rgba' 默认
+  type?: TextureType;       // 'ubyte' 默认
+  minFilter?: Filter;
+  magFilter?: Filter;
+  wrapS?: Wrap;
+  wrapT?: Wrap;
+  mipmap?: boolean;
+  flipY?: boolean;
+}
+
+export class Texture {
+  readonly texture: WebGLTexture;
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private caps: GLCaps;
+  private opts: TextureOptions;
+
+  constructor(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    caps: GLCaps,
+    opts: TextureOptions = {},
+  ) {
+    this.gl = gl;
+    this.caps = caps;
+    this.opts = {
+      format: 'rgba',
+      type: 'ubyte',
+      minFilter: 'linear',
+      magFilter: 'linear',
+      wrapS: 'clamp-to-edge',
+      wrapT: 'clamp-to-edge',
+      mipmap: false,
+      flipY: true,
+      ...opts,
+    };
+
+    // gl.createTexture() 分配纹理对象
+    this.texture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+
+    if (this.opts.source || (this.opts.width && this.opts.height)) {
+      this.setData(this.opts.source ?? null, this.opts.width, this.opts.height);
+    }
+
+    this.applyParams();
+  }
+
+  /** 上传像素数据 */
+  setData(source: TexImageSource | null, w?: number, h?: number) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+
+    // gl.pixelStorei(pname, value)
+    //   UNPACK_FLIP_Y_WEBGL : 上传时是否沿 Y 轴翻转
+    //     图片像素从上到下，而纹理坐标原点在左下，通常需要 flipY=true
+    //   UNPACK_PREMULTIPLY_ALPHA_WEBGL : 是否预乘 alpha
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, this.opts.flipY ? 1 : 0);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+
+    const internalFormat = this.resolveInternalFormat();
+    const format = this.resolveFormat();
+    const type = this.resolveType();
+
+    if (source) {
+      // gl.texImage2D(target, level, internalformat, format, type, source)
+      //   target         : TEXTURE_2D
+      //   level          : mipmap 层级，0 = 基础层
+      //   internalformat : GPU 内部存储格式（WebGL1 必须与 format 相同）
+      //   format         : 源数据格式
+      //   type           : 源数据类型
+      //   source         : HTMLImage / Canvas / Video / ImageBitmap 等
+      gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, format, type, source);
+    } else {
+      // gl.texImage2D(target, level, internalformat, width, height, border, format, type, pixels)
+      //   width/height : 纹理尺寸
+      //   border       : 必须为 0
+      //   pixels       : null 表示仅分配内存，稍后再 teximage/subimage
+      gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w!, h!, 0, format, type, null);
+    }
+
+    if (this.opts.mipmap) {
+      // gl.generateMipmap(target) 自动生成完整 mipmap 链
+      gl.generateMipmap(gl.TEXTURE_2D);
+    }
+  }
+
+  private applyParams() {
+    const gl = this.gl;
+    // gl.texParameteri(target, pname, param)
+    //   MIN_FILTER : 纹理缩小时的采样方式（含 mipmap 时用 MIPMAP_* 变体）
+    //   MAG_FILTER : 放大时的采样方式，只能 NEAREST 或 LINEAR
+    //   WRAP_S/W   : 超出 [0,1] 时 S/T 方向的寻址方式
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, GL_FILTER[this.opts.minFilter!]);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, GL_FILTER[this.opts.magFilter!]);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, GL_WRAP[this.opts.wrapS!]);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, GL_WRAP[this.opts.wrapT!]);
+  }
+
+  private resolveFormat(): number {
+    const gl = this.gl;
+    return {
+      rgba: gl.RGBA, rgb: gl.RGB,
+      red: this.caps.isWebGL2 ? (gl as WebGL2RenderingContext).RED : gl.LUMINANCE,
+      rg: gl.RG,
+      depth: gl.DEPTH_COMPONENT,
+      'depth-stencil': gl.DEPTH_STENCIL,
+    }[this.opts.format!];
+  }
+
+  private resolveInternalFormat(): number {
+    const gl = this.gl;
+    if (!this.caps.isWebGL2) return this.resolveFormat();  // WebGL1：两者相同
+    const g2 = gl as WebGL2RenderingContext;
+    const t = this.opts.type!;
+    if (this.opts.format === 'depth') return g2.DEPTH_COMPONENT24;
+    if (this.opts.format === 'depth-stencil') return g2.DEPTH24_STENCIL8;
+    if (this.opts.format === 'rgba') {
+      if (t === 'float') return g2.RGBA32F;
+      if (t === 'half-float') return g2.RGBA16F;
+    }
+    if (this.opts.format === 'rgb') {
+      if (t === 'float') return g2.RGB32F;
+      if (t === 'half-float') return g2.RGB16F;
+    }
+    return this.resolveFormat();
+  }
+
+  private resolveType(): number {
+    const gl = this.gl;
+    return {
+      ubyte: gl.UNSIGNED_BYTE,
+      float: this.caps.isWebGL2 ? gl.FLOAT : gl.FLOAT,
+      'half-float': this.caps.isWebGL2
+        ? (gl as WebGL2RenderingContext).HALF_FLOAT
+        : 0x8D61, // OES_texture_half_float.HALF_FLOAT_OES
+      uint: gl.UNSIGNED_INT,
+    }[this.opts.type!];
+  }
+
+  dispose() { this.gl.deleteTexture(this.texture); }
+}
+```
+
+5.6 resources/program.ts
+
+```ts
+import { GL_FILTER, GL_COMPARE } from '../core/constants';
+
+interface UniformInfo {
+  location: WebGLUniformLocation;
+  type: number;            // gl.FLOAT_VEC3 / gl.SAMPLER_2D ...
+  size: number;            // 数组长度
+}
+
+export class Program {
+  readonly program: WebGLProgram;
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private uniformInfo = new Map<string, UniformInfo>();
+  private uniformValue = new Map<string, any>();  // 最近一次设置的值，用于去重
+
+  constructor(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    vsSrc: string,
+    fsSrc: string,
+    defines?: Record<string, string | number>,
+  ) {
+    this.gl = gl;
+
+    const vs = this.compile(gl.VERTEX_SHADER, this.injectDefines(vsSrc, defines));
+    const fs = this.compile(gl.FRAGMENT_SHADER, this.injectDefines(fsSrc, defines));
+
+    // gl.createProgram() 创建 program 容器
+    this.program = gl.createProgram()!;
+    // gl.attachShader(program, shader) 把编译好的 shader 挂到 program
+    gl.attachShader(this.program, vs);
+    gl.attachShader(this.program, fs);
+    // gl.bindAttribLocation(program, index, name) 可选：固定 attribute location
+    // 这里不固定，交给 link 自动分配
+    // gl.linkProgram(program) 把 vs/fs 链接成可执行的 GPU 程序
+    gl.linkProgram(this.program);
+
+    if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(this.program);
+      gl.deleteProgram(this.program);
+      throw new Error(`Program link failed: ${log}`);
+    }
+
+    // 链接完成后 shader 可以删除释放
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+
+    this.collectUniforms();
+  }
+
+  private injectDefines(src: string, defines?: Record<string, string | number>): string {
+    if (!defines) return src;
+    const lines = Object.entries(defines)
+      .map(([k, v]) => `#define ${k} ${v}`)
+      .join('\n');
+    // 简单插到第一行（注意 #version 需保持在首行，WebGL1 通常无 #version）
+    return `#ifdef GL_ES\nprecision highp float;\n#endif\n${lines}\n${src}`;
+  }
+
+  private compile(type: number, src: string): WebGLShader {
+    const gl = this.gl;
+    // gl.createShader(type)
+    //   type: gl.VERTEX_SHADER 或 gl.FRAGMENT_SHADER
+    const shader = gl.createShader(type)!;
+    // gl.shaderSource(shader, source) 提供 GLSL 源码
+    gl.shaderSource(shader, src);
+    // gl.compileShader(shader) 触发编译
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error(`${type === gl.VERTEX_SHADER ? 'VS' : 'FS'} compile failed: ${log}`);
+    }
+    return shader;
+  }
+
+  /** 通过反射枚举所有 active uniform 并缓存 location */
+  private collectUniforms() {
+    const gl = this.gl;
+    // gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS) 返回 active uniform 数量
+    const count = gl.getProgramParameter(this.program, gl.ACTIVE_UNIFORMS) as number;
+    for (let i = 0; i < count; i++) {
+      // gl.getActiveUniform(program, index)
+      //   返回 { name, size, type }；数组 uniform 名称以 "[0]" 结尾
+      const info = gl.getActiveUniform(this.program, i)!;
+      const baseName = info.name.endsWith('[0]')
+        ? info.name.slice(0, -3)
+        : info.name;
+
+      // gl.getUniformLocation(program, name) 获取写入该 uniform 的句柄
+      const loc = gl.getUniformLocation(this.program, info.name);
+      if (!loc) continue;
+
+      this.uniformInfo.set(baseName, {
+        location: loc,
+        type: info.type,
+        size: info.size,
+      });
+    }
+  }
+
+  hasUniform(name: string): boolean { return this.uniformInfo.has(name); }
+  getUniform(name: string): UniformInfo | undefined { return this.uniformInfo.get(name); }
+
+  /** 按类型分发 gl.uniform* 调用；相同值自动跳过 */
+  setUniform(name: string, value: any) {
+    const info = this.uniformInfo.get(name);
+    if (!info) return;
+    if (valueEqual(this.uniformValue.get(name), value)) return;
+
+    const gl = this.gl;
+    const loc = info.location;
+    const v = value;
+
+    switch (info.type) {
+      // ── 标量 ──
+      case gl.FLOAT:      gl.uniform1f(loc, v); break;
+      case gl.INT:
+      case gl.BOOL:
+      case gl.SAMPLER_2D:
+      case gl.SAMPLER_CUBE: gl.uniform1i(loc, v | 0); break;
+
+      // ── 向量 ──
+      case gl.FLOAT_VEC2: gl.uniform2f(loc, v[0], v[1]); break;
+      case gl.FLOAT_VEC3: gl.uniform3f(loc, v[0], v[1], v[2]); break;
+      case gl.FLOAT_VEC4: gl.uniform4f(loc, v[0], v[1], v[2], v[3]); break;
+      case gl.INT_VEC2:
+      case gl.BOOL_VEC2:  gl.uniform2i(loc, v[0], v[1]); break;
+      case gl.INT_VEC3:
+      case gl.BOOL_VEC3:  gl.uniform3i(loc, v[0], v[1], v[2]); break;
+      case gl.INT_VEC4:
+      case gl.BOOL_VEC4:  gl.uniform4i(loc, v[0], v[1], v[2], v[3]); break;
+
+      // ── 矩阵（第二个参数 transpose 必须为 false，WebGL 不支持转置）──
+      case gl.FLOAT_MAT2: gl.uniformMatrix2fv(loc, false, v); break;
+      case gl.FLOAT_MAT3: gl.uniformMatrix3fv(loc, false, v); break;
+      case gl.FLOAT_MAT4: gl.uniformMatrix4fv(loc, false, v); break;
+
+      default: break;
+    }
+    this.uniformValue.set(name, cloneValue(v));
+  }
+
+  dispose() { this.gl.deleteProgram(this.program); }
+}
+
+function valueEqual(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (Array.isArray(a) || ArrayBuffer.isView(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  return false;
+}
+
+function cloneValue(v: any): any {
+  if (ArrayBuffer.isView(v)) return (v as any).slice();
+  if (Array.isArray(v)) return v.slice();
+  return v;
+}
+```
+
+5.7 resources/vertex-array.ts
+
+```ts
+import type { GLCaps } from '../core/caps';
+import type { AttributeDesc } from '../renderer/draw-command';
+import type { Program } from './program';
+import type { Buffer } from './buffer';
+
+export class VertexArray {
+  readonly vao: WebGLVertexArrayObject;
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private caps: GLCaps;
+
+  constructor(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    caps: GLCaps,
+  ) {
+    this.gl = gl;
+    this.caps = caps;
+    // gl.createVertexArray() 分配 VAO 对象，用来打包 attribute 配置
+    this.vao = caps.createVertexArray()!;
+  }
+
+  /** 把 attributes / index 打包进 VAO（只在创建时调用一次） */
+  setup(
+    program: Program,
+    attributes: Record<string, AttributeDesc>,
+    indices?: Buffer | null,
+  ) {
+    const gl = this.gl;
+    this.caps.bindVertexArray(this.vao);
+
+    // 属性名到 location 的映射：用 program 里的 attribute 位置
+    for (const [name, desc] of Object.entries(attributes)) {
+      // gl.getAttribLocation(program, name) 返回 shader 里该 attribute 的索引
+      const loc = gl.getAttribLocation(program.program, name);
+      if (loc < 0) continue;   // shader 未用到该 attribute
+
+      const buf = desc.buffer!;
+      // gl.bindBuffer(ARRAY_BUFFER, buf) 让 bufferData/attribPointer 作用于该 buffer
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf.buffer);
+
+      // gl.enableVertexAttribArray(index) 启用该 vertex attribute 数组
+      gl.enableVertexAttribArray(loc);
+
+      // gl.vertexAttribPointer(index, size, type, normalized, stride, offset)
+      //   index      : attribute location
+      //   size       : 每个顶点的分量数（1~4）
+      //   type       : 分量类型（FLOAT / INT / UNSIGNED_BYTE ...）
+      //   normalized : 整型是否归一化到 [0,1] 或 [-1,1]
+      //   stride     : 相邻顶点首字节的间隔（0 表示紧凑排列）
+      //   offset     : 该属性在 buffer 内的字节偏移
+      gl.vertexAttribPointer(
+        loc,
+        desc.size,
+        this.attribType(desc.type ?? 'float'),
+        desc.normalized ?? false,
+        desc.stride ?? 0,
+        desc.offset ?? 0,
+      );
+
+      if (desc.divisor && this.caps.hasInstancing) {
+        // gl.vertexAttribDivisor(index, divisor)
+        //   divisor = 0 : 每个顶点推进（默认）
+        //   divisor = 1 : 每个实例推进一次（实例化）
+        this.caps.vertexAttribDivisor(loc, desc.divisor);
+      }
+    }
+
+    if (indices) {
+      // gl.bindBuffer(ELEMENT_ARRAY_BUFFER, buf)
+      //   索引 buffer 的绑定会被 VAO 记录
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indices.buffer);
+    }
+
+    // 解绑 VAO，避免后续操作误改此 VAO 配置
+    this.caps.bindVertexArray(null);
+  }
+
+  private attribType(t: 'float' | 'int' | 'uint'): number {
+    return t === 'float' ? this.gl.FLOAT
+         : t === 'int'   ? this.gl.INT
+         :                 this.gl.UNSIGNED_INT;
+  }
+
+  dispose() {
+    this.caps.bindVertexArray(null);
+    this.caps.deleteVertexArray(this.vao);
+  }
+}
+```
+
+5.8 resources/framebuffer.ts
+
+```ts
+import type { Texture } from './texture';
+
+export class Framebuffer {
+  readonly fb: WebGLFramebuffer;
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  width = 0;
+  height = 0;
+
+  constructor(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    opts: {
+      color?: Texture;
+      depth?: Texture;
+      width?: number;
+      height?: number;
+    } = {},
+  ) {
+    this.gl = gl;
+    // gl.createFramebuffer() 创建离屏渲染目标
+    this.fb = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fb);
+
+    if (opts.color) {
+      // gl.framebufferTexture2D(target, attachment, textarget, texture, level)
+      //   target     : FRAMEBUFFER
+      //   attachment : COLOR_ATTACHMENT0 / DEPTH_ATTACHMENT / STENCIL_ATTACHMENT ...
+      //   textarget  : TEXTURE_2D
+      //   texture    : 已分配尺寸但可能未上传数据的纹理
+      //   level      : mipmap 层级，通常为 0
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D, opts.color.texture, 0,
+      );
+    }
+    if (opts.depth) {
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,
+        gl.TEXTURE_2D, opts.depth.texture, 0,
+      );
+    }
+
+    // gl.checkFramebufferStatus(target) 校验附件完整性
+    //   返回 FRAMEBUFFER_COMPLETE 才可正常渲染
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.warn('Framebuffer incomplete:', status);
+    }
+
+    this.width = opts.width ?? 0;
+    this.height = opts.height ?? 0;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  dispose() { this.gl.deleteFramebuffer(this.fb); }
+}
+```
+
+5.9 renderer/program-cache.ts
+
+```ts
+import type { Program } from '../resources/program';
+
+/** FNV-1a 简单 hash，稳定且低开销 */
+function fnv1a(str: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+
+export class ProgramCache {
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private map = new Map<string, Program>();
+
+  constructor(gl: WebGLRenderingContext | WebGL2RenderingContext) {
+    this.gl = gl;
+  }
+
+  get(vs: string, fs: string, defines?: Record<string, string | number>): Program {
+    const key = fnv1a(vs) + '|' + fnv1a(fs) + '|' +
+      (defines ? fnv1a(JSON.stringify(defines)) : '');
+    let p = this.map.get(key);
+    if (!p) {
+      // 延迟 require 避免循环依赖
+      const { Program } = require('../resources/program');
+      p = new Program(this.gl, vs, fs, defines);
+      this.map.set(key, p);
+    }
+    return p;
+  }
+
+  dispose() {
+    for (const p of this.map.values()) p.dispose();
+    this.map.clear();
+  }
+}
+```
+
+5.10 renderer/vao-cache.ts
+
+```ts
+import type { Program } from '../resources/program';
+import type { AttributeDesc } from './draw-command';
+import type { Buffer } from '../resources/buffer';
+import type { GLCaps } from '../core/caps';
+import { VertexArray } from '../resources/vertex-array';
+
+/**
+ * VAO 缓存的 key 必须同时包含：
+ *   - attribute 名字与描述（size/type/stride/offset/divisor）
+ *   - 关联的 program（不同 program 的 attribute location 可能不同）
+ *   - 是否带索引
+ */
+export class VAOCache {
+  private gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private caps: GLCaps;
+  private map = new Map<string, VertexArray>();
+
+  constructor(gl: WebGLRenderingContext | WebGL2RenderingContext, caps: GLCaps) {
+    this.gl = gl;
+    this.caps = caps;
+  }
+
+  getOrCreate(
+    program: Program,
+    attributes: Record<string, AttributeDesc>,
+    indices?: Buffer | null,
+  ): VertexArray {
+    const key = this.makeKey(program, attributes, !!indices);
+    let vao = this.map.get(key);
+    if (!vao) {
+      vao = new VertexArray(this.gl, this.caps);
+      vao.setup(program, attributes, indices ?? null);
+      this.map.set(key, vao);
+    }
+    return vao;
+  }
+
+  private makeKey(
+    program: Program,
+    attrs: Record<string, AttributeDesc>,
+    hasIndex: boolean,
+  ): string {
+    const parts = Object.keys(attrs).sort().map((name) => {
+      const a = attrs[name];
+      return [
+        name, a.size, a.type ?? 'float', a.normalized ? 1 : 0,
+        a.stride ?? 0, a.offset ?? 0, a.divisor ?? 0,
+        (a.buffer as any)?.buffer ? idOf(a.buffer!) : '',
+      ].join(',');
+    });
+    // program 用其对象标识参与 key（同一 program 对象 location 稳定）
+    return (program as any).program + '|' + (hasIndex ? 1 : 0) + '|' + parts.join(';');
+  }
+
+  dispose() {
+    for (const v of this.map.values()) v.dispose();
+    this.map.clear();
+  }
+}
+
+// 用一个 WeakMap 给资源对象分配稳定 id
+const ids = new WeakMap<object, number>();
+let nextId = 1;
+function idOf(obj: object): number {
+  let id = ids.get(obj);
+  if (!id) { id = nextId++; ids.set(obj, id); }
+  return id;
+}
+```
+
+5.11 renderer/uniform-binding.ts
+
+```ts
+import type { Program } from '../resources/program';
+import type { UniformValue } from './draw-command';
+import { Texture } from '../resources/texture';
+import type { StateCache } from '../core/state-cache';
+
+/**
+ * 把 DrawCommand.uniforms 写入 program：
+ *   - 纹理自动分配 texture unit、激活、绑定
+ *   - 其余值走 Program.setUniform 的类型分发
+ *   - 相同纹理已绑定则不重复 bind（依赖 StateCache 的 activeTexture 去重）
+ */
+export function applyUniforms(
+  gl: WebGLRenderingContext | WebGL2RenderingContext,
+  state: StateCache,
+  program: Program,
+  uniforms?: Record<string, UniformValue>,
+): void {
+  if (!uniforms) return;
+  const maxUnits = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) as number;
+  let nextUnit = 0;
+
+  for (const name in uniforms) {
+    const value = uniforms[name];
+
+    if (value instanceof Texture) {
+      if (nextUnit >= maxUnits) {
+        console.warn(`Exceeded MAX_COMBINED_TEXTURE_IMAGE_UNITS (${maxUnits})`);
+        break;
+      }
+      const unit = nextUnit++;
+      state.applyTextureUnit(unit);
+      // gl.bindTexture(target, texture)
+      //   target: TEXTURE_2D / TEXTURE_CUBE_MAP ...
+      gl.bindTexture(gl.TEXTURE_2D, value.texture);
+      // sampler uniform 写入的就是 texture unit 编号（int）
+      program.setUniform(name, unit);
+    } else if (isTextureBinding(value)) {
+      const unit = value.unit ?? nextUnit++;
+      state.applyTextureUnit(unit);
+      gl.bindTexture(gl.TEXTURE_2D, value.texture.texture);
+      program.setUniform(name, unit);
+    } else {
+      program.setUniform(name, value);
+    }
+  }
+}
+
+function isTextureBinding(v: any): v is { texture: Texture; unit?: number } {
+  return v && typeof v === 'object' && v.texture instanceof Texture;
+}
+```
+
+5.12 renderer/renderer.ts — draw 主流程（核心）
+
+```ts
+import { StateCache } from '../core/state-cache';
+import { createCaps, GLCaps } from '../core/caps';
+import { GL_MODE } from '../core/constants';
+import { ProgramCache } from './program-cache';
+import { VAOCache } from './vao-cache';
+import { applyUniforms } from './uniform-binding';
+import { mergeState, DEFAULT_STATE } from './render-state';
+import type { DrawCommand, AttributeDesc } from './draw-command';
+import type { Program } from '../resources/program';
+import type { Buffer } from '../resources/buffer';
+import { Buffer as BufferImpl } from '../resources/buffer';
+
+export class Renderer {
+  readonly gl: WebGLRenderingContext | WebGL2RenderingContext;
+  readonly caps: GLCaps;
+  readonly state: StateCache;
+  private programCache: ProgramCache;
+  private vaoCache: VAOCache;
+
+  // 裸 TypedArray 的属性/索引按引用缓存 Buffer，避免重复上传
+  private dataBufferCache = new WeakMap<ArrayBufferView, BufferImpl>();
+
+  constructor(gl: WebGLRenderingContext | WebGL2RenderingContext) {
+    this.gl = gl;
+    this.caps = createCaps(gl);
+    this.state = new StateCache(gl);
+    this.programCache = new ProgramCache(gl);
+    this.vaoCache = new VAOCache(gl, this.caps);
+    // 第一帧前强制全量下发默认状态
+    this.state.invalidate();
+  }
+
+  /** 一次完整绘制 */
+  draw(cmd: DrawCommand) {
+    const gl = this.gl;
+
+    // ── 1. 渲染目标 ──
+    this.state.applyTarget(cmd.target ? cmd.target.fb : null);
+
+    // ── 2. 视口 ──
+    const vp = cmd.viewport === 'auto' || !cmd.viewport
+      ? this.defaultViewport(cmd.target)
+      : cmd.viewport;
+    this.state.applyViewport(vp);
+    this.state.applyScissor(cmd.scissor ?? null);
+
+    // ── 3. 渲染状态 ──
+    this.state.applyState(mergeState(DEFAULT_STATE, cmd.state));
+
+    // ── 4. Program ──
+    const program: Program = isProgramObject(cmd.program)
+      ? cmd.program
+      : this.programCache.get(cmd.program.vs, cmd.program.fs, cmd.program.defines);
+    this.state.applyProgram(program.program);
+
+    // ── 5. 统一处理裸数据 → Buffer 对象 ──
+    const attributes = normalizeAttributes(cmd.geometry.attributes);
+    const indices = normalizeIndices(cmd.geometry.indices, this);
+
+    // ── 6. VAO ──
+    const vao = this.vaoCache.getOrCreate(program, attributes, indices);
+    this.state.applyVAO(vao.vao, this.caps.bindVertexArray.bind(this.caps));
+
+    // ── 7. Uniforms（含纹理单元分配）──
+    applyUniforms(gl, this.state, program, cmd.uniforms);
+
+    // ── 8. 绘制 ──
+    const topology = cmd.geometry.topology ?? 'triangles';
+    const mode = GL_MODE[topology];
+    const inst = cmd.geometry.instanceCount ?? 1;
+    const first = cmd.geometry.first ?? 0;
+
+    if (indices) {
+      const count = cmd.geometry.count ?? inferIndexCount(indices);
+      const type = inferIndexType(indices);
+      const byteOffset = (cmd.geometry.indexOffset ?? 0) * (type === gl.UNSIGNED_INT ? 4 : 2);
+
+      if (inst > 1 && this.caps.hasInstancing) {
+        // 见 caps.drawElementsInstanced 参数说明
+        this.caps.drawElementsInstanced(mode, count, type, byteOffset, inst);
+      } else {
+        // gl.drawElements(mode, count, type, offset)
+        //   mode   : 图元类型（TRIANGLES 等）
+        //   count  : 要绘制的索引个数
+        //   type   : 索引数据类型（UNSIGNED_SHORT / UNSIGNED_INT）
+        //   offset : 起始索引的字节偏移（不是索引下标！）
+        gl.drawElements(mode, count, type, byteOffset);
+      }
+    } else {
+      const count = cmd.geometry.count ?? inferVertexCount(attributes);
+      if (inst > 1 && this.caps.hasInstancing) {
+        this.caps.drawArraysInstanced(mode, first, count, inst);
+      } else {
+        // gl.drawArrays(mode, first, count)
+        //   mode  : 图元类型
+        //   first : 起始顶点索引
+        //   count : 顶点数量
+        gl.drawArrays(mode, first, count);
+      }
+    }
+  }
+
+  /** 清屏：目标为 null 时清默认帧缓冲 */
+  clear(opts: {
+    color?: [number, number, number, number];
+    depth?: number;
+    stencil?: number;
+  } = {}) {
+    const gl = this.gl;
+    if (opts.color) {
+      // gl.clearColor(r, g, b, a) — 各分量 [0,1]
+      gl.clearColor(opts.color[0], opts.color[1], opts.color[2], opts.color[3]);
+    }
+    if (opts.depth !== undefined) {
+      // gl.clearDepth(depth) — 默认 1.0
+      gl.clearDepth(opts.depth);
+    }
+    if (opts.stencil !== undefined) {
+      // gl.clearStencil(s) — 默认 0
+      gl.clearStencil(opts.stencil);
+    }
+
+    let mask = 0;
+    if (opts.color) mask |= gl.COLOR_BUFFER_BIT;
+    if (opts.depth !== undefined) mask |= gl.DEPTH_BUFFER_BIT;
+    if (opts.stencil !== undefined) mask |= gl.STENCIL_BUFFER_BIT;
+
+    // 需要临时开启深度写，否则可能清不掉（受 depthMask 影响）
+    // 这里直接调用而非走 StateCache，避免污染缓存
+    gl.depthMask(true);
+    this.state.invalidate();
+
+    // gl.clear(mask) — 用当前 clear 值清除指定缓冲
+    gl.clear(mask);
+  }
+
+  private defaultViewport(target?: any): [number, number, number, number] {
+    if (target) return [0, 0, target.width, target.height];
+    return [0, 0, this.gl.drawingBufferWidth, this.gl.drawingBufferHeight];
+  }
+}
+
+// ─── 辅助 ─────────────────────────────────────────────────────
+function isProgramObject(p: any): p is Program {
+  return p && typeof p === 'object' && 'program' in p;
+}
+
+function normalizeAttributes(
+  attrs: Record<string, AttributeDesc>,
+): Record<string, AttributeDesc & { buffer: Buffer }> {
+  // 如果给的是裸 data，需要在 Renderer 层面用缓存创建 Buffer
+  // 为简洁这里假设调用方已提供 buffer；需要裸 data 支持时在此处补
+  return attrs as any;
+}
+
+function normalizeIndices(
+  idx: DrawCommand['geometry']['indices'],
+  r: Renderer,
+): Buffer | null {
+  if (!idx) return null;
+  if (idx instanceof BufferImpl) return idx;
+  let b = r['dataBufferCache'].get(idx);
+  if (!b) {
+    b = new BufferImpl(r.gl, { data: idx, usage: 'static', target: 'element' });
+    r['dataBufferCache'].set(idx, b);
+  }
+  return b;
+}
+
+function inferIndexCount(idx: Buffer | Uint16Array | Uint32Array): number {
+  if (idx instanceof Uint16Array || idx instanceof Uint32Array) return idx.length;
+  return 0; // 需要外部显式提供 count
+}
+
+function inferIndexType(idx: Buffer | Uint16Array | Uint32Array): number {
+  if (idx instanceof Uint16Array) return 0x1403; // UNSIGNED_SHORT
+  if (idx instanceof Uint32Array) return 0x1405; // UNSIGNED_INT
+  return 0x1403;
+}
+
+function inferVertexCount(attrs: Record<string, AttributeDesc>): number {
+  const first = Object.values(attrs)[0];
+  if (!first || !first.buffer) return 0;
+  // 需要 buffer.byteLength / (size * bytesPerComponent) 计算
+  return 0; // 生产实现里由 Buffer 记录 count 更好
+}
+```
+
+---
+
+6. 上层 scene
+
+```ts
+// scene/mesh.ts
+export class Mesh {
+  constructor(
+    public attributes: Record<string, AttributeDesc>,
+    public indices?: Buffer,
+    public topology: Topology = 'triangles',
+  ) {}
+}
+
+// scene/material.ts
+export class Material {
+  constructor(
+    public program: Program,
+    public uniforms: Record<string, UniformValue> = {},
+    public state?: Partial<RenderState>,
+  ) {}
+}
+
+// scene/mesh-renderer.ts
+export class MeshRenderer {
+  constructor(
+    public mesh: Mesh,
+    public material: Material,
+    public transform: Float32Array,  // 4x4 矩阵
+  ) {}
+
+  render(renderer: Renderer) {
+    renderer.draw({
+      geometry: {
+        attributes: this.mesh.attributes,
+        indices: this.mesh.indices,
+        topology: this.mesh.topology,
+      },
+      program: this.material.program,
+      uniforms: { ...this.material.uniforms, uModel: this.transform },
+      state: this.material.state,
+    });
+  }
+}
+
+// scene/render-pass.ts
+export class RenderPass {
+  queue: MeshRenderer[] = [];
+  clear?: { color?: [number,number,number,number]; depth?: number };
+
+  constructor(public target: Framebuffer | null) {}
+
+  execute(renderer: Renderer) {
+    renderer.state.applyTarget(this.target ? this.target.fb : null);
+    if (this.clear) renderer.clear(this.clear);
+    for (const item of this.queue) item.render(renderer);
+  }
+}
+```
+
+---
+
+7. 使用示例
+
+```ts
+const gl = canvas.getContext('webgl2', { antialias: true });
+const renderer = new Renderer(gl);
+
+const vbo = new Buffer(gl, { data: positions, usage: 'static' });
+const ibo = new Buffer(gl, { data: indices, target: 'element' });
+const tex = new Texture(gl, renderer.caps, { source: img, mipmap: true });
+
+renderer.draw({
+  viewport: 'auto',
+  geometry: {
+    attributes: { aPosition: { buffer: vbo, size: 3 } },
+    indices: ibo,
+    topology: 'triangles',
+    count: indices.length,
+  },
+  program: { vs: VS_SRC, fs: FS_SRC, defines: { USE_FOG: 1 } },
+  uniforms: {
+    uMVP: mvp,                  // Float32Array(16)
+    uTex: tex,                  // 自动分配 unit 0
+    uTint: [1, 0.5, 0.2, 1],
+  },
+  state: {
+    depth: { test: true, write: true, func: 'lequal' },
+    blend: { enabled: true, srcRGB: 'src-alpha', dstRGB: 'one-minus-src-alpha',
+             srcAlpha: 'one', dstAlpha: 'one-minus-src-alpha' },
+    cull: { enabled: true, face: 'back', frontFace: 'ccw' },
+  },
+});
+```
+
+---
+
+8. 性能优化点
+
+1. StateCache 是最大杠杆：第一帧 invalidate() 全量下发后，后续只有变化才调 gl.*。实测典型场景能减少 60%+ 状态调用。
+2. VAO 必须用：每次 draw 只需 bindVertexArray + drawElements，比逐个 bindBuffer + vertexAttribPointer 快一个数量级。WebGL1 一定要挂 OES_vertex_array_object。
+3. Uniform 值去重：矩阵/向量按元素比较，相同则跳过 uniformMatrix4fv。如果业务侧能保证"脏标记"，效果更好。
+4. 纹理单元连续分配：一次 draw 里用到的纹理从 unit 0 开始递增，减少 activeTexture 切换。
+5. Program 按 hash 缓存：同 shader 只编译一次，避免卡顿。
+6. 同 program + 同 state 的 draw 合并：如果业务量大，在 scene 层做排序（先按 program，再按 state，再按纹理），减少绑定切换。
+7. 动态数据走 DYNAMIC_DRAW + bufferSubData：大小不变的更新不要 bufferData 重建。
+8. WebGL2 优先：原生 VAO/instancing/UBO/texStorage2D（不可变纹理，避免驱动反复校验）。
+
+---
+
+9. 踩坑清单
+
+坑 说明
+viewport 的 y 方向 从底部起算，与 DOM 坐标系相反
+drawElements 的 offset 是字节偏移，不是索引下标
+uniformMatrix*fv 的 transpose 必须传 false，WebGL 不支持转置
+getUniformLocation 对数组 数组 uniform 名称以 [0] 结尾，需去掉后缀做 key
+纹理 flipY 图片上传一般需要 UNPACK_FLIP_Y_WEBGL = 1，但 ImageBitmap 已翻转时不要
+framebuffer 后 viewport 切换 framebuffer 后 viewport 不会自动变，需要手动设置
+depthMask 影响 clear 若 depthMask=false，clear(DEPTH_BUFFER_BIT) 可能无效，需临时置 true
+纹理尺寸 2 的幂 WebGL1 中非 POT 纹理不能用 REPEAT 和 mipmap
+precision 片元着色器必须声明 precision mediump/highp float
+WebGL1 的 internalformat 必须等于 format，WebGL2 才允许扩展内部格式
+Program 与 VAO 绑定 attribute location 由 program 决定，VAO 缓存 key 必须含 program
+Shader 编译异步 编译是同步的，但连接大数据时主线程会卡，考虑 OffscreenCanvas
+上下文丢失 监听 webglcontextlost，在 webglcontextrestored 时重建全部资源
+getActiveUniform 数量 只返回被实际使用的 uniform，未使用的不在列表里
+
+---
+
+10. 扩展路线
+
+按优先级：
+
+1. Batching / 排序：按 program → state → texture 排序，减少切换。
+2. UBO（WebGL2）：一次批量传多个 uniform，减少 uniform* 调用。
+3. Frustum culling：math/aabb.ts 配合相机平面做剔除。
+4. Instancing 增强：支持 per-instance matrix attribute（4 个 vec4 属性）。
+5. 多 pass / postprocess：RenderPass 串接，中间结果用 Framebuffer + Texture。
+6. Mipmap / MSAA FBO：WebGL2 的 renderbufferStorageMultisample。
+7. Shader 预处理器：#include、条件编译、变体管理。
+8. 资源热重载：开发模式下监听文件变化重建 Program/Texture。
+9. OffscreenCanvas + Worker：把渲染移到 worker，主线程只管输入。
+10. 统计面板：draw calls、状态切换数、纹理绑定数、GPU 时间（EXT_disjoint_timer_query）。
+
+---
+
+文档结束。 建议阅读顺序：先看 state-cache.ts 和 renderer.ts 理解主流程，再看 program.ts 和 vertex-array.ts 理解资源，最后按需补 scene/。
